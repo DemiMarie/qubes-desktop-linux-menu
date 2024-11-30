@@ -28,7 +28,8 @@ from .constants import INITIAL_PAGE_FEATURE, SORT_RUNNING_FEATURE, \
 
 import gi
 gi.require_version('Gtk', '3.0')
-from gi.repository import Gtk, Gdk, GLib, Gio
+gi.require_version('GtkLayerShell', '0.1')
+from gi.repository import Gtk, Gdk, GLib, Gio, GtkLayerShell
 
 import gbulb
 gbulb.install()
@@ -93,10 +94,12 @@ class AppMenu(Gtk.Application):
         self.initial_page = "app_page"
         self.sort_running = False
         self.start_in_background = False
+        self.kde = "KDE" in os.getenv("XDG_CURRENT_DESKTOP", "").split(":")
 
         self._add_cli_options()
 
         self.builder: Optional[Gtk.Builder] = None
+        self.layer_shell: bool = False
         self.main_window: Optional[Gtk.Window] = None
         self.main_notebook: Optional[Gtk.Notebook] = None
 
@@ -144,6 +147,15 @@ class AppMenu(Gtk.Application):
             None,
         )
 
+        self.add_main_option(
+            "position",
+            0,
+            GLib.OptionFlags.NONE,
+            GLib.OptionArg.STRING,
+            "Position the window in the selected corner of the screen",
+            None,
+        )
+
     def do_command_line(self, command_line):
         """
         Handle CLI arguments. This method overrides default do_command_line
@@ -167,6 +179,11 @@ class AppMenu(Gtk.Application):
             self.initial_page = PAGE_LIST[int(options["page"])]
         if "background" in options:
             self.start_in_background = True
+        if "position" in options:
+            position = options["position"]
+            if position == "mouse" or position not in POSITION_LIST:
+                print(f"Invalid value for \"position\": {position!r}", file=sys.stderr)
+                sys.exit(1)
 
     @staticmethod
     def _do_power_button(_widget):
@@ -175,9 +192,7 @@ class AppMenu(Gtk.Application):
         providing our own tiny program.
         """
         # pylint: disable=consider-using-with
-        current_environs = os.environ.get('XDG_CURRENT_DESKTOP', '').split(':')
-
-        if 'KDE' in current_environs:
+        if self.kde:
             dbus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
             proxy = Gio.DBusProxy.new_sync(
                 dbus,  # dbus
@@ -203,21 +218,45 @@ class AppMenu(Gtk.Application):
         assert self.main_window
         match self.appmenu_position:
             case 'top-left':
-                self.main_window.move(0, 0)
+                if self.layer_shell:
+                    GtkLayerShell.set_anchor(self.main_window,
+                                             GtkLayerShell.Edge.LEFT, True)
+                    GtkLayerShell.set_anchor(self.main_window,
+                                             GtkLayerShell.Edge.TOP, True)
+                else:
+                    self.main_window.move(0, 0)
             case 'top-right':
-                self.main_window.move(
-                    self.main_window.get_screen().get_width() - \
-                    self.main_window.get_size().width, 0)
+                if self.layer_shell:
+                    GtkLayerShell.set_anchor(self.main_window,
+                                             GtkLayerShell.Edge.RIGHT, True)
+                    GtkLayerShell.set_anchor(self.main_window,
+                                             GtkLayerShell.Edge.TOP, True)
+                else:
+                    self.main_window.move(
+                        self.main_window.get_screen().get_width() -
+                        self.main_window.get_size().width, 0)
             case 'bottom-left':
-                self.main_window.move(0,
-                    self.main_window.get_screen().get_height() - \
-                    self.main_window.get_size().height)
+                if self.layer_shell:
+                    GtkLayerShell.set_anchor(self.main_window,
+                                             GtkLayerShell.Edge.LEFT, True)
+                    GtkLayerShell.set_anchor(self.main_window,
+                                             GtkLayerShell.Edge.BOTTOM, True)
+                else:
+                    self.main_window.move(0,
+                        self.main_window.get_screen().get_height() -
+                        self.main_window.get_size().height)
             case 'bottom-right':
-                self.main_window.move(
-                    self.main_window.get_screen().get_width() - \
-                    self.main_window.get_size().width,
-                    self.main_window.get_screen().get_height() - \
-                    self.main_window.get_size().height)
+                if self.layer_shell:
+                    GtkLayerShell.set_anchor(self.main_window,
+                                             GtkLayerShell.Edge.RIGHT, True)
+                    GtkLayerShell.set_anchor(self.main_window,
+                                             GtkLayerShell.Edge.BOTTOM, True)
+                else:
+                    self.main_window.move(
+                        self.main_window.get_screen().get_width() -
+                        self.main_window.get_size().width,
+                        self.main_window.get_screen().get_height() -
+                        self.main_window.get_size().height)
 
     def do_activate(self, *args, **kwargs):
         """
@@ -234,12 +273,23 @@ class AppMenu(Gtk.Application):
                 self.reposition()
                 self.main_window.show_all()
             self.initialize_state()
-            # set size if too big
+            current_width = self.main_window.get_allocated_width()
             current_height = self.main_window.get_allocated_height()
-            max_height = self.main_window.get_screen().get_height() * 0.9
+            # set size if too big
+            max_height = int(self.main_window.get_screen().get_height() * 0.9)
+            assert max_height > 0
             if current_height > max_height:
-                self.main_window.resize(self.main_window.get_allocated_width(),
-                                        int(max_height))
+                self.main_window.resize(current_height, max_height)
+            if self.layer_shell:
+                # The default for layer shell is no keyboard input.
+                # Explicitly request exclusive access to the keyboard.
+                GtkLayerShell.set_keyboard_mode(self.main_window,
+                                        GtkLayerShell.KeyboardMode.EXCLUSIVE)
+                # Work around https://github.com/wmww/gtk-layer-shell/issues/167
+                # by explicitly setting the window size.
+                self.main_window.set_size_request(
+                        current_width,
+                        min(current_height, max_height))
 
             # grab a focus on the initially selected page so that keyboard
             # navigation works
@@ -331,6 +381,7 @@ class AppMenu(Gtk.Application):
             self.builder.add_from_file(str(path))
 
         self.main_window = self.builder.get_object('main_window')
+        self.layer_shell = GtkLayerShell.is_supported()
         self.main_notebook = self.builder.get_object('main_notebook')
 
         self.main_window.set_events(Gdk.EventMask.FOCUS_CHANGE_MASK)
@@ -375,6 +426,10 @@ class AppMenu(Gtk.Application):
                 'domain-feature-delete:' + feature,
                 self._update_settings)
 
+        if self.layer_shell:
+            GtkLayerShell.init_for_window(self.main_window)
+            GtkLayerShell.set_exclusive_zone(self.main_window, 0)
+
     def load_style(self, *_args):
         """Load appropriate CSS stylesheet and associated properties."""
         light_ref = (importlib.resources.files('qubes_menu') /
@@ -415,6 +470,9 @@ class AppMenu(Gtk.Application):
         position = local_vm.features.get(POSITION_FEATURE, "mouse")
         if position not in POSITION_LIST:
             position = "mouse"
+        if position == "mouse" and self.layer_shell:
+            # "mouse" unsupported under Wayland
+            position = "bottom-left" if self.kde else "top-left"
         self.appmenu_position = position
 
         for handler in self.handlers.values():
